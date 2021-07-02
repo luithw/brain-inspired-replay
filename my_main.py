@@ -165,23 +165,6 @@ class AutoEncoder(ContinualLearner):
             self.z_class_means.data.normal_()
             self.z_class_logvars.data.normal_()
 
-
-    ##------ LAYERS --------##
-
-    def list_init_layers(self):
-        '''Return list of modules whose parameters could be initialized differently (i.e., conv- or fc-layers).'''
-        list = []
-        list += self.convE.list_init_layers()
-        list += self.fcE.list_init_layers()
-        if hasattr(self, "classifier"):
-            list += self.classifier.list_init_layers()
-        list += self.toZ.list_init_layers()
-        list += self.fromZ.list_init_layers()
-        list += self.fcD.list_init_layers()
-        if not self.hidden:
-            list += self.convD.list_init_layers()
-        return list
-
     ##------ FORWARD FUNCTIONS --------##
 
     def encode(self, x, not_hidden=False):
@@ -198,17 +181,9 @@ class AutoEncoder(ContinualLearner):
 
     def classify(self, x, not_hidden=False, reparameterize=True, **kwargs):
         '''For input [x] (image or extracted "internal" image features), return all predicted "scores"/"logits".'''
-        if hasattr(self, "classifier"):
-            image_features = self.flatten(x) if (self.hidden and not not_hidden) else self.flatten(self.convE(x))
-            hE = self.fcE(image_features)
-            if self.classify_opt == "beforeZ":
-                return self.classifier(hE)
-            else:
-                (mu, logvar) = self.toZ(hE)
-                z = mu if (self.classify_opt == "fromZ" or (not reparameterize)) else self.reparameterize(mu, logvar)
-                return self.classifier(z)
-        else:
-            return None
+        image_features = self.flatten(x) if (self.hidden and not not_hidden) else self.flatten(self.convE(x))
+        hE = self.fcE(image_features)
+        return self.classifier(hE)
 
     def forward(self, x, gate_input=None, full=False, reparameterize=True, **kwargs):
         '''Forward function to propagate [x] through the encoder, reparametrization and decoder.
@@ -225,25 +200,15 @@ class AutoEncoder(ContinualLearner):
         - [logvar]      None or <2D-tensor> estimated log(SD^2) of [z]
         - [z]           <2D-tensor> reparameterized [z] used for reconstruction
         If [full] is False, output is simply the predicted logits (i.e., [y_hat]).'''
-        if full:
-            # -encode (forward), reparameterize and decode (backward)
-            mu, logvar, hE, hidden_x = self.encode(x)
-            z = self.reparameterize(mu, logvar) if reparameterize else mu
-            gate_input = gate_input if self.dg_gates else None
-            x_recon = self.decode(z, gate_input=gate_input)
-            # -classify
-            if hasattr(self, "classifier"):
-                if self.classify_opt in ["beforeZ", "fromZ"]:
-                    y_hat = self.classifier(hE) if self.classify_opt=="beforeZ" else self.classifier(mu)
-                else:
-                    raise NotImplementedError("Classification-option {} not implemented.".format(self.classify_opt))
-            else:
-                y_hat = None
-            # -return
-            return (x_recon, y_hat, mu, logvar, z)
-        else:
-            return self.classify(x, reparameterize=reparameterize) #-> if [full]=False, only forward pass for prediction
-
+        # -encode (forward), reparameterize and decode (backward)
+        mu, logvar, hE, hidden_x = self.encode(x)
+        z = self.reparameterize(mu, logvar) if reparameterize else mu
+        gate_input = gate_input if self.dg_gates else None
+        x_recon = self.decode(z, gate_input=gate_input)
+        # -classify
+        y_hat = self.classifier(hE) if self.classify_opt=="beforeZ" else self.classifier(mu)
+        # -return
+        return (x_recon, y_hat, mu, logvar, z)
 
     def reparameterize(self, mu, logvar):
         '''Perform "reparametrization trick" to make these stochastic variables differentiable.'''
@@ -290,75 +255,35 @@ class AutoEncoder(ContinualLearner):
         self.eval()
 
         # pick for each sample the prior-mode to be used
-        if self.prior == "GMM":
-            if sample_mode is None:
-                if (allowed_classes is None and class_probs is None) or (not self.per_class):
-                    # -randomly sample modes from all possible modes (and find their corresponding class, if applicable)
-                    sampled_modes = np.random.randint(0, self.n_modes, size)
-                    y_used = np.array(
-                        [int(mode / self.modes_per_class) for mode in sampled_modes]
-                    ) if self.per_class else None
-                else:
-                    if allowed_classes is None:
-                        allowed_classes = [i for i in range(len(class_probs))]
-                    # -sample from modes belonging to [allowed_classes], possibly weighted according to [class_probs]
-                    allowed_modes = []  # -collect all allowed modes
-                    unweighted_probs = []  # -collect unweighted sample-probabilities of those modes
-                    for index, class_id in enumerate(allowed_classes):
-                        allowed_modes += list(
-                            range(class_id * self.modes_per_class, (class_id + 1) * self.modes_per_class))
-                        if class_probs is not None:
-                            for i in range(self.modes_per_class):
-                                unweighted_probs.append(class_probs[index].item())
-                    mode_probs = None if class_probs is None else [p / sum(unweighted_probs) for p in unweighted_probs]
-                    sampled_modes = np.random.choice(allowed_modes, size, p=mode_probs, replace=True)
-                    y_used = np.array([int(mode / self.modes_per_class) for mode in sampled_modes])
-            else:
-                # -always sample from the provided mode
-                sampled_modes = np.repeat(sample_mode, size)
-                y_used = np.repeat(int(sample_mode / self.modes_per_class), size) if self.per_class else None
-        else:
-            y_used = None
+        # -sample from modes belonging to [allowed_classes], possibly weighted according to [class_probs]
+        allowed_modes = []  # -collect all allowed modes
+        unweighted_probs = []  # -collect unweighted sample-probabilities of those modes
+        for index, class_id in enumerate(allowed_classes):
+            allowed_modes += list(
+                range(class_id * self.modes_per_class, (class_id + 1) * self.modes_per_class))
+        mode_probs = None if class_probs is None else [p / sum(unweighted_probs) for p in unweighted_probs]
+        sampled_modes = np.random.choice(allowed_modes, size, p=mode_probs, replace=True)
+        y_used = np.array([int(mode / self.modes_per_class) for mode in sampled_modes])
 
         # sample z
-        if self.prior == "GMM":
-            prior_means = self.z_class_means
-            prior_logvars = self.z_class_logvars
-            # -for each sample to be generated, select the previously sampled mode
-            z_means = prior_means[sampled_modes, :]
-            z_logvars = prior_logvars[sampled_modes, :]
-            with torch.no_grad():
-                z = self.reparameterize(z_means, z_logvars)
-        else:
-            z = torch.randn(size, self.z_dim).to(self._device())
+        prior_means = self.z_class_means
+        prior_logvars = self.z_class_logvars
+        # -for each sample to be generated, select the previously sampled mode
+        z_means = prior_means[sampled_modes, :]
+        z_logvars = prior_logvars[sampled_modes, :]
+        with torch.no_grad():
+            z = self.reparameterize(z_means, z_logvars)
 
-        # if no classes are selected yet, but they are needed for the "decoder-gates", select classes to be sampled
-        if (y_used is None) and (self.dg_gates):
-            if allowed_classes is None and class_probs is None:
-                y_used = np.random.randint(0, self.classes, size)
-            else:
-                if allowed_classes is None:
-                    allowed_classes = [i for i in range(len(class_probs))]
-                y_used = np.random.choice(allowed_classes, size, p=class_probs, replace=True)
         # if the gates in the decoder are "task-gates", convert [y_used] to corresponding tasks (if Task-IL or Class-IL)
         #   or simply sample which tasks should be generated (if Domain-IL) from [allowed_domains]
         task_used = None
-        if self.dg_gates and self.dg_type == "task":
-            if self.scenario == "domain":
-                task_used = np.random.randint(0, self.gate_size, size) if (
-                            allowed_domains is None) else np.random.choice(
-                    allowed_domains, size, replace=True
-                )
-            else:
-                classes_per_task = int(self.classes / self.gate_size)
-                task_used = np.array([int(class_id / classes_per_task) for class_id in y_used])
 
         # decode z into image X
         with torch.no_grad():
-            X = self.decode(z, gate_input=(task_used if self.dg_type == "task" else y_used) if self.dg_gates else None)
+            X = self.decode(z, gate_input=y_used)
 
         # return samples as [batch_size]x[channels]x[image_size]x[image_size] tensor, plus requested additional info
-        return X if only_x else (X, y_used, task_used)
+        return X, y_used, task_used
 
     ##------ LOSS FUNCTIONS --------##
 
@@ -370,20 +295,10 @@ class AutoEncoder(ContinualLearner):
                 - [average]     <bool>, if True, loss is average over all pixels; otherwise it is summed
 
         OUTPUT: - [reconL]      <1D-tensor> of length [batch_size]'''
-
         batch_size = x.size(0)
-        if self.recon_loss == "MSE":
-            # reconL = F.mse_loss(input=x_recon.view(batch_size, -1), target=x.view(batch_size, -1), reduction='none')
-            # reconL = torch.mean(reconL, dim=1) if average else torch.sum(reconL, dim=1)
-            reconL = -lf.log_Normal_standard(x=x, mean=x_recon, average=average, dim=-1)
-        elif self.recon_loss == "BCE":
-            reconL = F.binary_cross_entropy(input=x_recon.view(batch_size, -1), target=x.view(batch_size, -1),
-                                            reduction='none')
-            reconL = torch.mean(reconL, dim=1) if average else torch.sum(reconL, dim=1)
-        else:
-            raise NotImplementedError("Wrong choice for type of reconstruction-loss!")
-        # --> if [average]=True, reconstruction loss is averaged over all pixels/elements (otherwise it is summed)
-        #       (averaging over all elements in the batch will be done later)
+        reconL = F.binary_cross_entropy(input=x_recon.view(batch_size, -1), target=x.view(batch_size, -1),
+                                        reduction='none')
+        reconL = torch.mean(reconL, dim=1) if average else torch.sum(reconL, dim=1)
         return reconL
 
     def calculate_log_p_z(self, z, y=None, y_prob=None, allowed_classes=None):
@@ -398,52 +313,47 @@ class AutoEncoder(ContinualLearner):
 
         OUTPUT: - [log_p_z]   <1D-tensor> of length [batch_size]'''
 
-        if self.prior == "standard":
-            log_p_z = lf.log_Normal_standard(z, average=False, dim=1)  # [batch_size]
+        ## Get [means] and [logvars] of all (possible) modes
+        allowed_modes = list(range(self.n_modes))
+        # -if we don't use the specific modes of a target, we could select modes based on list of classes
+        if (y is None) and (allowed_classes is not None) and self.per_class:
+            allowed_modes = []
+            for class_id in allowed_classes:
+                allowed_modes += list(range(class_id * self.modes_per_class, (class_id + 1) * self.modes_per_class))
+        # -calculate/retireve the means and logvars for the selected modes
+        prior_means = self.z_class_means[allowed_modes, :]
+        prior_logvars = self.z_class_logvars[allowed_modes, :]
+        # -rearrange / select for each batch prior-modes to be used
+        z_expand = z.unsqueeze(1)  # [batch_size] x 1 x [z_dim]
+        means = prior_means.unsqueeze(0)  # 1 x [n_modes] x [z_dim]
+        logvars = prior_logvars.unsqueeze(0)  # 1 x [n_modes] x [z_dim]
 
-        if self.prior == "GMM":
-            ## Get [means] and [logvars] of all (possible) modes
-            allowed_modes = list(range(self.n_modes))
-            # -if we don't use the specific modes of a target, we could select modes based on list of classes
-            if (y is None) and (allowed_classes is not None) and self.per_class:
-                allowed_modes = []
-                for class_id in allowed_classes:
-                    allowed_modes += list(range(class_id * self.modes_per_class, (class_id + 1) * self.modes_per_class))
-            # -calculate/retireve the means and logvars for the selected modes
-            prior_means = self.z_class_means[allowed_modes, :]
-            prior_logvars = self.z_class_logvars[allowed_modes, :]
-            # -rearrange / select for each batch prior-modes to be used
-            z_expand = z.unsqueeze(1)  # [batch_size] x 1 x [z_dim]
-            means = prior_means.unsqueeze(0)  # 1 x [n_modes] x [z_dim]
-            logvars = prior_logvars.unsqueeze(0)  # 1 x [n_modes] x [z_dim]
+        ## Calculate "log_p_z" (log-likelihood of "reparameterized" [z] based on selected priors)
+        n_modes = self.modes_per_class
+        a = lf.log_Normal_diag(z_expand, mean=means, log_var=logvars, average=False, dim=2) - math.log(n_modes)
+        # --> for each element in batch, calculate log-likelihood for all pseudoinputs: [batch_size] x [n_modes]
+        if (y is not None) and self.per_class:
+            modes_list = list()
+            for i in range(len(y)):
+                target = y[i].item()
+                modes_list.append(list(range(target * self.modes_per_class, (target + 1) * self.modes_per_class)))
+            modes_tensor = torch.LongTensor(modes_list).to(self._device())
+            a = a.gather(dim=1, index=modes_tensor)
+            # --> reduce [a] to size [batch_size]x[modes_per_class] (ie, per batch only keep modes of [y])
+            #     but within the batch, elements can have different [y], so this reduction couldn't be done before
 
-            ## Calculate "log_p_z" (log-likelihood of "reparameterized" [z] based on selected priors)
-            n_modes = self.modes_per_class if (
-                    ((y is not None) or (y_prob is not None)) and self.per_class
-            ) else len(allowed_modes)
-            a = lf.log_Normal_diag(z_expand, mean=means, log_var=logvars, average=False, dim=2) - math.log(n_modes)
-            # --> for each element in batch, calculate log-likelihood for all pseudoinputs: [batch_size] x [n_modes]
-            if (y is not None) and self.per_class:
-                modes_list = list()
-                for i in range(len(y)):
-                    target = y[i].item()
-                    modes_list.append(list(range(target * self.modes_per_class, (target + 1) * self.modes_per_class)))
-                modes_tensor = torch.LongTensor(modes_list).to(self._device())
-                a = a.gather(dim=1, index=modes_tensor)
-                # --> reduce [a] to size [batch_size]x[modes_per_class] (ie, per batch only keep modes of [y])
-                #     but within the batch, elements can have different [y], so this reduction couldn't be done before
-            a_max, _ = torch.max(a, dim=1)  # [batch_size]
-            # --> for each element in batch, take highest log-likelihood over all pseudoinputs
-            #     this is calculated and used to avoid underflow in the below computation
-            a_exp = torch.exp(a - a_max.unsqueeze(1))  # [batch_size] x [n_modes]
-            if (y is None) and (y_prob is not None) and self.per_class:
-                batch_size = y_prob.size(0)
-                y_prob = y_prob.view(-1, 1).repeat(1, self.modes_per_class).view(batch_size, -1)
-                # ----> extend probabilities per class to probabilities per mode; y_prob: [batch_size] x [n_modes]
-                a_logsum = torch.log(torch.clamp(torch.sum(y_prob * a_exp, dim=1), min=1e-40))
-            else:
-                a_logsum = torch.log(torch.clamp(torch.sum(a_exp, dim=1), min=1e-40))  # -> sum over modes: [batch_size]
-            log_p_z = a_logsum + a_max  # [batch_size]
+        a_max, _ = torch.max(a, dim=1)  # [batch_size]
+        # --> for each element in batch, take highest log-likelihood over all pseudoinputs
+        #     this is calculated and used to avoid underflow in the below computation
+        a_exp = torch.exp(a - a_max.unsqueeze(1))  # [batch_size] x [n_modes]
+        if (y is None) and (y_prob is not None) and self.per_class:
+            batch_size = y_prob.size(0)
+            y_prob = y_prob.view(-1, 1).repeat(1, self.modes_per_class).view(batch_size, -1)
+            # ----> extend probabilities per class to probabilities per mode; y_prob: [batch_size] x [n_modes]
+            a_logsum = torch.log(torch.clamp(torch.sum(y_prob * a_exp, dim=1), min=1e-40))
+        else:
+            a_logsum = torch.log(torch.clamp(torch.sum(a_exp, dim=1), min=1e-40))  # -> sum over modes: [batch_size]
+        log_p_z = a_logsum + a_max  # [batch_size]
 
         return log_p_z
 
@@ -461,25 +371,19 @@ class AutoEncoder(ContinualLearner):
 
         OUTPUT: - [variatL]   <1D-tensor> of length [batch_size]'''
 
-        if self.prior == "standard":
-            # --> calculate analytically
-            # ---- see Appendix B from: Kingma & Welling (2014) Auto-Encoding Variational Bayes, ICLR ----#
-            variatL = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        # --> calculate "by estimation"
 
-        elif self.prior == "GMM":
-            # --> calculate "by estimation"
+        ## Calculate "log_p_z" (log-likelihood of "reparameterized" [z] based on selected priors)
+        log_p_z = self.calculate_log_p_z(z, y=y, y_prob=y_prob, allowed_classes=allowed_classes)
+        # ----->  log_p_z: [batch_size]
 
-            ## Calculate "log_p_z" (log-likelihood of "reparameterized" [z] based on selected priors)
-            log_p_z = self.calculate_log_p_z(z, y=y, y_prob=y_prob, allowed_classes=allowed_classes)
-            # ----->  log_p_z: [batch_size]
+        ## Calculate "log_q_z_x" (entropy of "reparameterized" [z] given [x])
+        log_q_z_x = lf.log_Normal_diag(z, mean=mu, log_var=logvar, average=False, dim=1)
+        # ----->  mu: [batch_size] x [z_dim]; logvar: [batch_size] x [z_dim]; z: [batch_size] x [z_dim]
+        # ----->  log_q_z_x: [batch_size]
 
-            ## Calculate "log_q_z_x" (entropy of "reparameterized" [z] given [x])
-            log_q_z_x = lf.log_Normal_diag(z, mean=mu, log_var=logvar, average=False, dim=1)
-            # ----->  mu: [batch_size] x [z_dim]; logvar: [batch_size] x [z_dim]; z: [batch_size] x [z_dim]
-            # ----->  log_q_z_x: [batch_size]
-
-            ## Combine
-            variatL = -(log_p_z - log_q_z_x)
+        ## Combine
+        variatL = -(log_p_z - log_q_z_x)
 
         return variatL
 
@@ -511,26 +415,23 @@ class AutoEncoder(ContinualLearner):
         reconL = lf.weighted_average(reconL, weights=batch_weights, dim=0)  # -> average over batch
 
         ###-----Variational loss-----###
-        if logvar is not None:
-            actual_y = torch.tensor([allowed_classes[i.item()] for i in y]).to(self._device()) if (
-                    (allowed_classes is not None) and (y is not None)
-            ) else y
-            if (y is None and scores is not None):
-                y_prob = F.softmax(scores / self.KD_temp, dim=1)
-                if allowed_classes is not None and len(allowed_classes) > y_prob.size(1):
-                    n_batch = y_prob.size(0)
-                    zeros_to_add = torch.zeros(n_batch, len(allowed_classes) - y_prob.size(1))
-                    zeros_to_add = zeros_to_add.to(self._device())
-                    y_prob = torch.cat([y_prob, zeros_to_add], dim=1)
-            else:
-                y_prob = None
-            # ---> if [y] is not provided but [scores] is, calculate variational loss using weighted sum of prior-modes
-            variatL = self.calculate_variat_loss(z=z, mu=mu, logvar=logvar, y=actual_y, y_prob=y_prob,
-                                                 allowed_classes=allowed_classes)
-            variatL = lf.weighted_average(variatL, weights=batch_weights, dim=0)  # -> average over batch
-            variatL /= (self.image_channels * self.image_size ** 2)  # -> divide by # of input-pixels
+        actual_y = torch.tensor([allowed_classes[i.item()] for i in y]).to(self._device()) if (
+                (allowed_classes is not None) and (y is not None)
+        ) else y
+        if (y is None and scores is not None):
+            y_prob = F.softmax(scores / self.KD_temp, dim=1)
+            if allowed_classes is not None and len(allowed_classes) > y_prob.size(1):
+                n_batch = y_prob.size(0)
+                zeros_to_add = torch.zeros(n_batch, len(allowed_classes) - y_prob.size(1))
+                zeros_to_add = zeros_to_add.to(self._device())
+                y_prob = torch.cat([y_prob, zeros_to_add], dim=1)
         else:
-            variatL = torch.tensor(0., device=self._device())
+            y_prob = None
+        # ---> if [y] is not provided but [scores] is, calculate variational loss using weighted sum of prior-modes
+        variatL = self.calculate_variat_loss(z=z, mu=mu, logvar=logvar, y=actual_y, y_prob=y_prob,
+                                             allowed_classes=allowed_classes)
+        variatL = lf.weighted_average(variatL, weights=batch_weights, dim=0)  # -> average over batch
+        variatL /= (self.image_channels * self.image_size ** 2)  # -> divide by # of input-pixels
 
         ###-----Prediction loss-----###
         if y is not None and y_hat is not None:
@@ -577,29 +478,28 @@ class AutoEncoder(ContinualLearner):
 
         ##--(1)-- CURRENT DATA --##
         precision = 0.
-        if x is not None:
-            # If using task-gates, create [task_tensor] as it's needed in the decoder
-            task_tensor = None
+        # If using task-gates, create [task_tensor] as it's needed in the decoder
+        task_tensor = None
 
-            # Run the model
-            x = self.convE(x) if self.hidden else x  # -pre-processing (if 'hidden')
-            recon_batch, y_hat, mu, logvar, z = self(x, gate_input=y, full=True, reparameterize=True)
-            # -if needed ("class"/"task"-scenario), find allowed classes for current task & remove predictions of others
-            class_entries = active_classes[-1] if type(active_classes[0]) == list else active_classes
-            y_hat = y_hat[:, class_entries]
+        # Run the model
+        x = self.convE(x) if self.hidden else x  # -pre-processing (if 'hidden')
+        recon_batch, y_hat, mu, logvar, z = self(x, gate_input=y, full=True, reparameterize=True)
+        # -if needed ("class"/"task"-scenario), find allowed classes for current task & remove predictions of others
+        class_entries = active_classes[-1] if type(active_classes[0]) == list else active_classes
+        y_hat = y_hat[:, class_entries]
 
-            # Calculate all losses
-            reconL, variatL, predL, _ = self.loss_function(
-                x=x, y=y, x_recon=recon_batch, y_hat=y_hat, scores=None, mu=mu, z=z, logvar=logvar,
-                allowed_classes=class_entries
-            )  # --> [allowed_classes] will be used only if [y] is not provided
+        # Calculate all losses
+        reconL, variatL, predL, _ = self.loss_function(
+            x=x, y=y, x_recon=recon_batch, y_hat=y_hat, scores=None, mu=mu, z=z, logvar=logvar,
+            allowed_classes=class_entries
+        )  # --> [allowed_classes] will be used only if [y] is not provided
 
-            # Weigh losses as requested
-            loss_cur = self.lamda_rcl * reconL + self.lamda_vl * variatL + self.lamda_pl * predL
+        # Weigh losses as requested
+        loss_cur = self.lamda_rcl * reconL + self.lamda_vl * variatL + self.lamda_pl * predL
 
-            # Calculate training-precision
-            _, predicted = y_hat.max(1)
-            precision = (y == predicted).sum().item() / x.size(0)
+        # Calculate training-precision
+        _, predicted = y_hat.max(1)
+        precision = (y == predicted).sum().item() / x.size(0)
 
         ##--(2)-- REPLAYED DATA --##
         if x_ is not None:
