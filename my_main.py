@@ -40,7 +40,7 @@ class AutoEncoder(ContinualLearner):
                  recon_loss='BCE', network_output="sigmoid", deconv_type="standard", hidden=False,
                  dg_gates=False, dg_type="task", dg_prop=0., tasks=5, scenario="task", device='cuda',
                  # -classifer
-                 classifier=True, classify_opt="beforeZ",
+                 classifier=True,
                  # -training-specific settings (can be changed after setting up model)
                  lamda_pl=0., lamda_rcl=1., lamda_vl=1., **kwargs):
 
@@ -55,7 +55,6 @@ class AutoEncoder(ContinualLearner):
         self.h_dim = h_dim
         self.fc_units = fc_units
         self.fc_drop = fc_drop
-        self.classify_opt = classify_opt
         self.depth = depth if convE is None else convE.depth
         # -replay hidden representations? (-> replay only propagates through fc-layers)
         self.hidden = hidden
@@ -119,33 +118,24 @@ class AutoEncoder(ContinualLearner):
 
         ##>----Classifier----<##
         if classifier:
-            self.units_before_classifier = real_h_dim if self.classify_opt == 'beforeZ' else z_dim
+            self.units_before_classifier = real_h_dim
             self.classifier = fc_layer(self.units_before_classifier, classes, excit_buffer=True, nl='none')
 
         ##>----Decoder (= p[x|z])----<##
         out_nl = True if fc_layers > 1 else (True if (self.depth > 0 and not no_fnl) else False)
         real_h_dim_down = h_dim if fc_layers > 1 else self.convE.out_units(image_size, ignore_gp=True)
-        if self.dg_gates:
-            self.fromZ = fc_layer_fixed_gates(
-                z_dim, real_h_dim_down, batch_norm=(out_nl and fc_bn), nl=fc_nl if out_nl else "none",
-                gate_size=self.gate_size, gating_prop=dg_prop, device=device
-            )
-        else:
-            self.fromZ = fc_layer(z_dim, real_h_dim_down, batch_norm=(out_nl and fc_bn), nl=fc_nl if out_nl else "none")
+        self.fromZ = fc_layer_fixed_gates(
+            z_dim, real_h_dim_down, batch_norm=(out_nl and fc_bn), nl=fc_nl if out_nl else "none",
+            gate_size=self.gate_size, gating_prop=dg_prop, device=device
+        )
         fc_layer_sizes_down = self.fc_layer_sizes
         fc_layer_sizes_down[0] = self.convE.out_units(image_size, ignore_gp=True)
         # -> if 'gp' is used in forward pass, size of first/final hidden layer differs between forward and backward pass
-        if self.dg_gates:
-            self.fcD = MLP_gates(
-                size_per_layer=[x for x in reversed(fc_layer_sizes_down)], drop=fc_drop, batch_norm=fc_bn, nl=fc_nl,
-                gate_size=self.gate_size, gating_prop=dg_prop, device=device,
-                output=self.network_output if (self.depth == 0 or self.hidden) else 'normal',
-            )
-        else:
-            self.fcD = MLP(
-                size_per_layer=[x for x in reversed(fc_layer_sizes_down)], drop=fc_drop, batch_norm=fc_bn, nl=fc_nl,
-                gated=fc_gated, output=self.network_output if (self.depth == 0 or self.hidden) else 'normal',
-            )
+        self.fcD = MLP_gates(
+            size_per_layer=[x for x in reversed(fc_layer_sizes_down)], drop=fc_drop, batch_norm=fc_bn, nl=fc_nl,
+            gate_size=self.gate_size, gating_prop=dg_prop, device=device,
+            output=self.network_output if (self.depth == 0 or self.hidden) else 'normal',
+        )
         # to image-shape
         self.to_image = modules.Reshape(image_channels=self.convE.out_channels if self.depth > 0 else image_channels)
         # through deconv-layers
@@ -167,54 +157,33 @@ class AutoEncoder(ContinualLearner):
 
     ##------ FORWARD FUNCTIONS --------##
 
-    def encode(self, x, not_hidden=False):
+    def forward(self, x, gate_input=None, **kwargs):
+        '''Forward function to propagate [x] through the encoder, reparametrization and decoder.
+
+        Input: - [x]          <4D-tensor> of shape [batch_size]x[channels]x[image_size]x[image_size]
+                              (or <4D-tensor> of shape [batch_size]x[out_channels]x[out_size]x[outsize], if self.hidden)
+               - [gate_input] <1D-tensor> or <np.ndarray>; for each batch-element in [x] its class-ID (eg, [y]) ---OR---
+                              <2D-tensor>; for each batch-element in [x] a probability for each class-ID (eg, [y_hat])'''
+        # -encode (forward), reparameterize and decode (backward)
+        mu, logvar, hE, hidden_x = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        x_recon = self.decode(z, gate_input=gate_input)
+        # -classify
+        y_hat = self.classifier(hE)
+        # -return
+        return (x_recon, y_hat, mu, logvar, z)
+
+    def encode(self, x):
         '''Pass input through feed-forward connections, to get [z_mean], [z_logvar] and [hE].
         Input [x] is either an image or, if [self.hidden], extracted "intermediate" or "internal" image features.'''
         # Forward-pass through conv-layers
-        hidden_x = x if (self.hidden and not not_hidden) else self.convE(x)
+        hidden_x = self.convE(x)
         image_features = self.flatten(hidden_x)
         # Forward-pass through fc-layers
         hE = self.fcE(image_features)
         # Get parameters for reparametrization
         (z_mean, z_logvar) = self.toZ(hE)
         return z_mean, z_logvar, hE, hidden_x
-
-    def classify(self, x, not_hidden=False, reparameterize=True, **kwargs):
-        '''For input [x] (image or extracted "internal" image features), return all predicted "scores"/"logits".'''
-        image_features = self.flatten(x) if (self.hidden and not not_hidden) else self.flatten(self.convE(x))
-        hE = self.fcE(image_features)
-        return self.classifier(hE)
-
-    def forward(self, x, gate_input=None, full=False, reparameterize=True, **kwargs):
-        '''Forward function to propagate [x] through the encoder, reparametrization and decoder.
-
-        Input: - [x]          <4D-tensor> of shape [batch_size]x[channels]x[image_size]x[image_size]
-                              (or <4D-tensor> of shape [batch_size]x[out_channels]x[out_size]x[outsize], if self.hidden)
-               - [gate_input] <1D-tensor> or <np.ndarray>; for each batch-element in [x] its class-ID (eg, [y]) ---OR---
-                              <2D-tensor>; for each batch-element in [x] a probability for each class-ID (eg, [y_hat])
-
-        If [full] is True, output should be a <tuple> consisting of:
-        - [x_recon]     <4D-tensor> reconstructed image (features) in same shape as [x] (or 2 of those: mean & logvar)
-        - [y_hat]       <2D-tensor> with predicted logits for each class
-        - [mu]          <2D-tensor> with either [z] or the estimated mean of [z]
-        - [logvar]      None or <2D-tensor> estimated log(SD^2) of [z]
-        - [z]           <2D-tensor> reparameterized [z] used for reconstruction
-        If [full] is False, output is simply the predicted logits (i.e., [y_hat]).'''
-        # -encode (forward), reparameterize and decode (backward)
-        mu, logvar, hE, hidden_x = self.encode(x)
-        z = self.reparameterize(mu, logvar) if reparameterize else mu
-        gate_input = gate_input if self.dg_gates else None
-        x_recon = self.decode(z, gate_input=gate_input)
-        # -classify
-        y_hat = self.classifier(hE) if self.classify_opt=="beforeZ" else self.classifier(mu)
-        # -return
-        return (x_recon, y_hat, mu, logvar, z)
-
-    def reparameterize(self, mu, logvar):
-        '''Perform "reparametrization trick" to make these stochastic variables differentiable.'''
-        std = logvar.mul(0.5).exp_()
-        eps = std.new(std.size()).normal_()  # .requires_grad_()
-        return eps.mul(std).add_(mu)
 
     def decode(self, z, gate_input=None):
         '''Decode latent variable activations.
@@ -226,14 +195,26 @@ class AutoEncoder(ContinualLearner):
         OUTPUT: - [image_recon]  <4D-tensor>'''
 
         # -if needed, convert [gate_input] to one-hot vector
-        if self.dg_gates and (gate_input is not None) and (type(gate_input) == np.ndarray or gate_input.dim() < 2):
+        if type(gate_input) == np.ndarray or gate_input.dim() < 2:
             gate_input = lf.to_one_hot(gate_input, classes=self.gate_size, device=self._device())
 
         # -put inputs through decoder
-        hD = self.fromZ(z, gate_input=gate_input) if self.dg_gates else self.fromZ(z)
-        image_features = self.fcD(hD, gate_input=gate_input) if self.dg_gates else self.fcD(hD)
+        hD = self.fromZ(z, gate_input=gate_input)
+        image_features = self.fcD(hD, gate_input=gate_input)
         image_recon = self.convD(self.to_image(image_features))
         return image_recon
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+
+    def classify(self, x, not_hidden=False, **kwargs):
+        '''For input [x] (image or extracted "internal" image features), return all predicted "scores"/"logits".'''
+        image_features = self.flatten(x) if (self.hidden and not not_hidden) else self.flatten(self.convE(x))
+        hE = self.fcE(image_features)
+        return self.classifier(hE)
+
 
     ##------ SAMPLE FUNCTIONS --------##
 
@@ -261,8 +242,7 @@ class AutoEncoder(ContinualLearner):
         for index, class_id in enumerate(allowed_classes):
             allowed_modes += list(
                 range(class_id * self.modes_per_class, (class_id + 1) * self.modes_per_class))
-        mode_probs = None if class_probs is None else [p / sum(unweighted_probs) for p in unweighted_probs]
-        sampled_modes = np.random.choice(allowed_modes, size, p=mode_probs, replace=True)
+        sampled_modes = np.random.choice(allowed_modes, size, replace=True)
         y_used = np.array([int(mode / self.modes_per_class) for mode in sampled_modes])
 
         # sample z
@@ -287,7 +267,7 @@ class AutoEncoder(ContinualLearner):
 
     ##------ LOSS FUNCTIONS --------##
 
-    def calculate_recon_loss(self, x, x_recon, average=False):
+    def calculate_recon_loss(self, x, x_recon):
         '''Calculate reconstruction loss for each element in the batch.
 
         INPUT:  - [x]           <tensor> with original input (1st dimension (ie, dim=0) is "batch-dimension")
@@ -297,8 +277,7 @@ class AutoEncoder(ContinualLearner):
         OUTPUT: - [reconL]      <1D-tensor> of length [batch_size]'''
         batch_size = x.size(0)
         reconL = F.binary_cross_entropy(input=x_recon.view(batch_size, -1), target=x.view(batch_size, -1),
-                                        reduction='none')
-        reconL = torch.mean(reconL, dim=1) if average else torch.sum(reconL, dim=1)
+                                        reduction='mean')
         return reconL
 
     def calculate_log_p_z(self, z, y=None, y_prob=None, allowed_classes=None):
@@ -387,7 +366,7 @@ class AutoEncoder(ContinualLearner):
 
         return variatL
 
-    def loss_function(self, x, y, x_recon, y_hat, scores, mu, z, logvar=None, allowed_classes=None, batch_weights=None):
+    def loss_function(self, x, y, x_recon, y_hat, scores, mu, z, logvar=None, allowed_classes=None):
         '''Calculate and return various losses that could be used for training and/or evaluating the model.
 
         INPUT:  - [x]           <4D-tensor> original image
@@ -399,7 +378,6 @@ class AutoEncoder(ContinualLearner):
                 - [mu]             <2D-tensor> with either [z] or the estimated mean of [z]
                 - [z]              <2D-tensor> with reparameterized [z]
                 - [logvar]         None or <2D-tensor> with estimated log(SD^2) of [z]
-                - [batch_weights]  <1D-tensor> with a weight for each batch-element (if None, normal average over batch)
                 - [allowed_classes]None or <list> with class-IDs to use for selecting prior-mode(s)
 
         OUTPUT: - [reconL]       reconstruction loss indicating how well [x] and [x_recon] match
@@ -409,10 +387,7 @@ class AutoEncoder(ContinualLearner):
                                      match the target "logits" ([scores])'''
 
         ###-----Reconstruction loss-----###
-        batch_size = x.size(0)
-        reconL = self.calculate_recon_loss(x=x.view(batch_size, -1), average=True,
-                                           x_recon=x_recon.view(batch_size, -1))  # -> average over pixels
-        reconL = lf.weighted_average(reconL, weights=batch_weights, dim=0)  # -> average over batch
+        reconL = self.calculate_recon_loss(x=x, x_recon=x_recon).mean(0)  # -> average over pixels
 
         ###-----Variational loss-----###
         actual_y = torch.tensor([allowed_classes[i.item()] for i in y]).to(self._device()) if (
@@ -421,23 +396,18 @@ class AutoEncoder(ContinualLearner):
         if (y is None and scores is not None):
             y_prob = F.softmax(scores / self.KD_temp, dim=1)
             if allowed_classes is not None and len(allowed_classes) > y_prob.size(1):
-                n_batch = y_prob.size(0)
-                zeros_to_add = torch.zeros(n_batch, len(allowed_classes) - y_prob.size(1))
-                zeros_to_add = zeros_to_add.to(self._device())
+                zeros_to_add = torch.zeros(y_prob.size(0), len(allowed_classes) - y_prob.size(1)).to(self._device())
                 y_prob = torch.cat([y_prob, zeros_to_add], dim=1)
         else:
             y_prob = None
         # ---> if [y] is not provided but [scores] is, calculate variational loss using weighted sum of prior-modes
         variatL = self.calculate_variat_loss(z=z, mu=mu, logvar=logvar, y=actual_y, y_prob=y_prob,
-                                             allowed_classes=allowed_classes)
-        variatL = lf.weighted_average(variatL, weights=batch_weights, dim=0)  # -> average over batch
+                                             allowed_classes=allowed_classes).mean(0)
         variatL /= (self.image_channels * self.image_size ** 2)  # -> divide by # of input-pixels
 
         ###-----Prediction loss-----###
         if y is not None and y_hat is not None:
-            predL = F.cross_entropy(input=y_hat, target=y, reduction='none')
-            # --> no reduction needed, summing over classes is "implicit"
-            predL = lf.weighted_average(predL, weights=batch_weights, dim=0)  # -> average over batch
+            predL = F.cross_entropy(input=y_hat, target=y, reduction='mean')
         else:
             predL = torch.tensor(0., device=self._device())
 
@@ -445,8 +415,7 @@ class AutoEncoder(ContinualLearner):
         if scores is not None and y_hat is not None:
             # n_classes_to_consider = scores.size(1) #--> with this version, no zeroes would be added to [scores]!
             n_classes_to_consider = y_hat.size(1)  # --> zeros will be added to [scores] to make it this size!
-            distilL = lf.loss_fn_kd(scores=y_hat[:, :n_classes_to_consider], target_scores=scores, T=self.KD_temp,
-                                    weights=batch_weights)  # --> summing over classes & averaging over batch in function
+            distilL = lf.loss_fn_kd(scores=y_hat[:, :n_classes_to_consider], target_scores=scores, T=self.KD_temp)  # --> summing over classes & averaging over batch in function
         else:
             distilL = torch.tensor(0., device=self._device())
 
@@ -454,8 +423,7 @@ class AutoEncoder(ContinualLearner):
         return reconL, variatL, predL, distilL
 
     ##------ TRAINING FUNCTIONS --------##
-    def train_a_batch(self, x, y=None, x_=None, y_=None, scores_=None, tasks_=None, rnt=0.5,
-                      active_classes=None, task=1, replay_not_hidden=False, freeze_convE=False, **kwargs):
+    def train_a_batch(self, x, y=None, x_=None, y_=None, scores_=None, rnt=0.5, active_classes=None):
         '''Train model for one batch ([x],[y]), possibly supplemented with replayed data ([x_],[y_]).
 
         [x]                 <tensor> batch of inputs (could be None, in which case only 'replayed' data is used)
@@ -464,11 +432,8 @@ class AutoEncoder(ContinualLearner):
                               NOTE: expected to be at hidden level if [self.hidden], unless [replay_not_hidden]==True
         [y_]                None or (<list> of) <1Dtensor>:[batch] of corresponding "replayed" labels
         [scores_]           None or (<list> of) <2Dtensor>:[batch]x[classes] target "scores"/"logits" for [x_]
-        [tasks_]            None or (<list> of) <1Dtensor>/<ndarray>:[batch] of task-IDs of replayed samples (as <int>)
         [rnt]               <number> in [0,1], relative importance of new task
-        [active_classes]    None or (<list> of) <list> with "active" classes
-        [task]              <int>, for setting task-specific mask
-        [replay_not_hidden] <bool> provided [x_] are original images, even though other level might be expected'''
+        [active_classes]    None or (<list> of) <list> with "active" classes'''
 
         # Set model to training-mode
         self.train()
@@ -476,22 +441,16 @@ class AutoEncoder(ContinualLearner):
         # Reset optimizer
         self.optimizer.zero_grad()
 
-        ##--(1)-- CURRENT DATA --##
-        precision = 0.
-        # If using task-gates, create [task_tensor] as it's needed in the decoder
-        task_tensor = None
-
         # Run the model
         x = self.convE(x) if self.hidden else x  # -pre-processing (if 'hidden')
-        recon_batch, y_hat, mu, logvar, z = self(x, gate_input=y, full=True, reparameterize=True)
+        recon_batch, y_hat, mu, logvar, z = self(x, gate_input=y)
         # -if needed ("class"/"task"-scenario), find allowed classes for current task & remove predictions of others
-        class_entries = active_classes[-1] if type(active_classes[0]) == list else active_classes
-        y_hat = y_hat[:, class_entries]
+        y_hat = y_hat[:, active_classes]
 
         # Calculate all losses
         reconL, variatL, predL, _ = self.loss_function(
             x=x, y=y, x_recon=recon_batch, y_hat=y_hat, scores=None, mu=mu, z=z, logvar=logvar,
-            allowed_classes=class_entries
+            allowed_classes=active_classes
         )  # --> [allowed_classes] will be used only if [y] is not provided
 
         # Weigh losses as requested
@@ -503,60 +462,36 @@ class AutoEncoder(ContinualLearner):
 
         ##--(2)-- REPLAYED DATA --##
         if x_ is not None:
-            # In the Task-IL scenario, [y_] or [scores_] is a list and [x_] needs to be evaluated on each of them
-            TaskIL = (type(y_) == list) if (y_ is not None) else (type(scores_) == list)
-            y_ = [y_]
-            scores_ = [scores_]
-            active_classes = [active_classes]
-            n_replays = len(scores_)
-
-            # Prepare lists to store losses for each replay
-            loss_replay = [torch.tensor(0., device=self._device())] * n_replays
-            reconL_r = [torch.tensor(0., device=self._device())] * n_replays
-            variatL_r = [torch.tensor(0., device=self._device())] * n_replays
-            predL_r = [torch.tensor(0., device=self._device())] * n_replays
-            distilL_r = [torch.tensor(0., device=self._device())] * n_replays
 
             # Run model (if [x_] is not a list with separate replay per task and there is no task-specific mask)
             # -if needed in the decoder-gates, find class-tensor [y_predicted]
-            y_predicted = None
-            y_predicted = F.softmax(scores_[0] / self.KD_temp, dim=1)
+            y_predicted = F.softmax(scores_ / self.KD_temp, dim=1)
             # in case of Class-IL, add zeros at the end:
             n_batch = y_predicted.size(0)
             zeros_to_add = torch.zeros(n_batch, self.classes - y_predicted.size(1))
             zeros_to_add = zeros_to_add.to(self._device())
             y_predicted = torch.cat([y_predicted, zeros_to_add], dim=1)
-            # -pre-processing (if 'hidden' and [replay_not_hidden] is provided as True)
-            x_temp_ = self.convE(x_) if self.hidden and replay_not_hidden else x_
             # -run full model
-            gate_input = (tasks_ if self.dg_type == "task" else y_predicted) if self.dg_gates else None
-            recon_batch, y_hat_all, mu, logvar, z = self(x_temp_, gate_input=gate_input, full=True)
-
-            # Loop to perform each replay
-            for replay_id in range(n_replays):
-                # ---> NOTE: pre-processing is sometimes needed for 'hidden' (as only generated replay comes as features)
+            recon_batch, y_hat_all, mu, logvar, z = self(x_, gate_input=y_predicted)
 
 
-                # -if needed (e.g., "class" or "task" scenario), remove predictions for classes not in replayed task
-                y_hat = y_hat_all if (
-                        active_classes is None or y_hat_all is None
-                ) else y_hat_all[:, active_classes[replay_id]]
+            # perform replay
+            # -if needed (e.g., "class" or "task" scenario), remove predictions for classes not in replayed task
+            y_hat = y_hat_all[:, active_classes]
 
-                # Calculate all losses
-                reconL_r[replay_id], variatL_r[replay_id], predL_r[replay_id], distilL_r[
-                    replay_id] = self.loss_function(
-                    x=x_temp_, y=y_[replay_id] if (y_ is not None) else None, x_recon=recon_batch, y_hat=y_hat,
-                    scores=scores_[replay_id] if (scores_ is not None) else None, mu=mu, z=z, logvar=logvar,
-                    allowed_classes=active_classes[replay_id] if active_classes is not None else None,
-                )
-                # Weigh losses as requested
-                loss_replay[replay_id] = self.lamda_rcl * reconL_r[replay_id] + self.lamda_vl * variatL_r[replay_id]
-                loss_replay[replay_id] += self.lamda_pl * distilL_r[replay_id]
+            # Calculate all losses
+            reconL_r, variatL_r, predL_r, distilL_r = self.loss_function(
+                x=x_, y=y_, x_recon=recon_batch, y_hat=y_hat,
+                scores=scores_, mu=mu, z=z, logvar=logvar,
+                allowed_classes=active_classes,
+            )
+            # Weigh losses as requested
+            loss_replay = self.lamda_rcl * reconL_r + self.lamda_vl * variatL_r
+            loss_replay += self.lamda_pl * distilL_r
 
         # Calculate total loss
-        loss_replay = None if (x_ is None) else sum(loss_replay) / n_replays
-        loss_total = loss_replay if (x is None) else (
-            loss_cur if x_ is None else rnt * loss_cur + (1 - rnt) * loss_replay)
+        loss_replay = None if (x_ is None) else loss_replay
+        loss_total = loss_cur if x_ is None else rnt * loss_cur + (1 - rnt) * loss_replay
 
         ##--(3)-- ALLOCATION LOSSES --##
         loss_total.backward()
@@ -568,30 +503,28 @@ class AutoEncoder(ContinualLearner):
             'recon': reconL.item() if x is not None else 0,
             'variat': variatL.item() if x is not None else 0,
             'pred': predL.item() if x is not None else 0,
-            'recon_r': sum(reconL_r).item() / n_replays if x_ is not None else 0,
-            'variat_r': sum(variatL_r).item() / n_replays if x_ is not None else 0,
-            'pred_r': sum(predL_r).item() / n_replays if x_ is not None else 0,
-            'distil_r': sum(distilL_r).item() / n_replays if x_ is not None else 0,
+            'recon_r': reconL_r if x_ is not None else 0,
+            'variat_r': variatL_r if x_ is not None else 0,
+            'pred_r': predL_r if x_ is not None else 0,
+            'distil_r': distilL_r if x_ is not None else 0,
         }
 
 
-def train_cl(model, train_datasets, replay_mode="none", scenario="task", rnt=None, classes_per_task=None,
-             iters=2000, batch_size=32, batch_size_replay=None, loss_cbs=list(), eval_cbs=list(), sample_cbs=list(),
-             generator=None, gen_iters=0, gen_loss_cbs=list(), feedback=False, reinit=False, args=None, only_last=False):
+def train_cl(model, train_datasets, replay_mode="none", classes_per_task=None, iters=2000, batch_size=32, loss_cbs=list()):
 
     device = model._device()
     cuda = model._is_on_cuda()
     batch_size_replay = batch_size
 
     # Initiate indicators for replay (no replay for 1st task)
-    Generative = Current = Offline_TaskIL = False
+    Generative = False
     previous_model = None
 
     # Loop over all tasks.
     for task, train_dataset in enumerate(train_datasets, 1):
 
         # Initialize # iters left on data-loader(s)
-        iters_left = 1 if (not Offline_TaskIL) else [1]*task
+        iters_left = 1
 
         # -for "class"-scenario, create one <list> with active classes of all tasks so far
         active_classes = list(range(classes_per_task*task))
@@ -614,9 +547,7 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="task", rnt=Non
 
             #####-----CURRENT BATCH-----#####
             x, y = next(data_loader)                                    #--> sample training data of current task
-            y = y-classes_per_task*(task-1) if scenario=="task" else y  #--> ITL: adjust y-targets to 'active range'
             x, y = x.to(device), y.to(device)                           #--> transfer them to correct device
-
 
             #####-----REPLAYED BATCH-----#####
             x_ = y_ = scores_ = task_used = None   #-> if no replay
@@ -641,33 +572,26 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="task", rnt=Non
                 task_used = x_temp_[2]
 
             #--------------------------------------------OUTPUTS----------------------------------------------------#
-
             if Generative:
                 # Get target scores & possibly labels (i.e., [scores_] / [y_]) -- use previous model, with no_grad()
                 # -if replay does not need to be evaluated for each task (ie, not Task-IL and no task-specific mask)
                 with torch.no_grad():
-                    all_scores_ = previous_model.classify(x_, not_hidden=False if Generative else True)
-                scores_ = all_scores_[:, :(classes_per_task*(task-1))] if (
-                        scenario=="class"
-                ) else all_scores_ # -> when scenario=="class", zero probs will be added in [loss_fn_kd]-function
+                    all_scores_ = previous_model.classify(x_, not_hidden=False)
+                # when scenario=="class", zero probs will be added in [loss_fn_kd]-function
+                scores_ = all_scores_[:, :(classes_per_task*(task-1))]
                 # -also get the 'hard target'
                 _, y_ = torch.max(scores_, dim=1)
 
             # -only keep predicted y_/scores_ if required (as otherwise unnecessary computations will be done)
-            y_ = y_ if (model.replay_targets=="hard") else None
-            scores_ = scores_ if (model.replay_targets=="soft") else None
+            y_ = None
 
             #-----------------Train model(s)------------------#
 
             #---> Train MAIN MODEL
             if batch_index <= iters_main:
                 # Train the main model with this batch
-                loss_dict = model.train_a_batch(x, y=y, x_=x_, y_=y_, scores_=scores_,
-                                                tasks_=task_used, active_classes=active_classes, task=task, rnt=(
-                                                    1. if task==1 else 1./task
-                                                ) if rnt is None else rnt, freeze_convE=False,
-                                                replay_not_hidden=False if Generative else True)
-
+                loss_dict = model.train_a_batch(x, y=y, x_=x_, y_=y_, scores_=scores_, active_classes=active_classes,
+                                                rnt=(1. if task==1 else 1./task))
 
                 # Fire callbacks (for visualization of training-progress / evaluating performance after each task)
                 for loss_cb in loss_cbs:
@@ -681,9 +605,10 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="task", rnt=Non
 
         # REPLAY: update source for replay
         previous_model = copy.deepcopy(model).eval()
-        if replay_mode=="generative":
+        if replay_mode == "generative":
             Generative = True
-            previous_generator = previous_model if feedback else copy.deepcopy(generator).eval()
+            previous_generator = previous_model
+
 
 def validate(model, dataset, batch_size=128, test_size=1024, verbose=True, allowed_classes=None,
              no_task_mask=False, task=None):
@@ -754,7 +679,7 @@ if __name__ == "__main__":
         recon_loss="BCE", network_output="sigmoid", deconv_type="standard", dg_gates=True, dg_type="class",
         dg_prop=0.8, tasks=5, scenario="class", device=device,
         # -classifier
-        classifier=True, classify_opt="beforeZ",
+        classifier=True,
         # -training-specific components
         lamda_rcl=1., lamda_vl=1., lamda_pl=1.,
     ).to(device)
@@ -781,13 +706,9 @@ if __name__ == "__main__":
     ]
 
     train_cl(
-        model, train_datasets, replay_mode=args.replay if hasattr(args, 'replay') else "none",
-        scenario=args.scenario, classes_per_task=classes_per_task, iters=args.iters,
-        batch_size=args.batch, batch_size_replay=args.batch_replay if hasattr(args, 'batch_replay') else None,
-        generator=generator, gen_iters=args.g_iters, gen_loss_cbs=generator_loss_cbs,
-        feedback=True, sample_cbs=[None], eval_cbs=[None],
-        loss_cbs=generator_loss_cbs,
-        args=args, reinit=False, only_last=False
+        model, train_datasets, replay_mode=args.replay,
+        classes_per_task=classes_per_task, iters=args.iters,
+        batch_size=args.batch, loss_cbs=generator_loss_cbs
     )
 
     # Evaluate precision of final model on full test-set
